@@ -10,6 +10,12 @@ weight is one twentieth of the combined width and height, matching the
 Detection deliberately works on PDF geometry, not OCR: checks created by
 Fill & Sign (or by flattening a Fill & Sign PDF) are vector paths or small
 annotation appearances.  Manual placement covers scanned/rasterised pages.
+
+Vector marks are written back as Adobe Fill & Sign page objects (a
+``/ADBE_FillSign`` marked-content block wrapping ``/page``, ``/fields`` and
+``/check`` form XObjects), not as plain page-content strokes.  That private
+tree is what lets Acrobat's Fill & Sign tool select, move and resize the
+copied marks.  Image-only appearances remain ordinary images.
 """
 
 from __future__ import annotations
@@ -841,6 +847,361 @@ def project_mark(
     return MappedMark(kind="image", rect=rect, png=mark.png)
 
 
+def _pdf_number(value: float) -> str:
+    """Compact PDF number formatting for generated form dictionaries."""
+
+    value = float(value)
+    if abs(value) < 1e-9:
+        return "0"
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def _pdf_colour(colour: Sequence[float]) -> str:
+    return " ".join(_pdf_number(c) for c in colour[:3])
+
+
+def _ensure_indirect_dict(doc: fitz.Document, xref: int, key: str) -> int:
+    """Return an indirect dictionary for ``key``, making one if necessary.
+
+    PyMuPDF's ``xref_set_key`` cannot write through an indirect object in a
+    key path, so resources have to be resolved to an indirect dictionary
+    before a new ``/XObject`` entry can be added.
+    """
+
+    typ, val = doc.xref_get_key(xref, key)
+    if typ == "xref":
+        return int(val.split()[0])
+    new_xref = doc.get_new_xref()
+    doc.update_object(new_xref, val if typ == "dict" else "<<>>")
+    doc.xref_set_key(xref, key, f"{new_xref} 0 R")
+    return new_xref
+
+
+def _page_resources(doc: fitz.Document, page: fitz.Page) -> int:
+    """Return the page's own resources dictionary.
+
+    Resources may be inherited from the page tree.  In that case they are
+    copied onto this page first so adding a form cannot affect sibling pages.
+    """
+
+    xref = page.xref
+    for _ in range(32):
+        typ, val = doc.xref_get_key(xref, "Resources")
+        if typ == "xref":
+            return int(val.split()[0])
+        if typ == "dict":
+            resources = doc.get_new_xref()
+            doc.update_object(resources, val)
+            doc.xref_set_key(page.xref, "Resources", f"{resources} 0 R")
+            return resources
+        ptype, pval = doc.xref_get_key(xref, "Parent")
+        if ptype != "xref":
+            break
+        xref = int(pval.split()[0])
+
+    resources = doc.get_new_xref()
+    doc.update_object(resources, "<<>>")
+    doc.xref_set_key(page.xref, "Resources", f"{resources} 0 R")
+    return resources
+
+
+def _add_page_xobject(doc: fitz.Document, page: fitz.Page, name: str, xref: int) -> None:
+    resources = _page_resources(doc, page)
+    xobjects = _ensure_indirect_dict(doc, resources, "XObject")
+    doc.xref_set_key(xobjects, name, f"{xref} 0 R")
+
+
+def _fillsign_ocg(doc: fitz.Document) -> int:
+    """Find or create the optional-content group used by Fill & Sign marks."""
+
+    catalog = doc.pdf_catalog()
+    typ, val = doc.xref_get_key(catalog, "OCProperties")
+    if typ == "null":
+        ocg = doc.get_new_xref()
+        doc.update_object(ocg, "<< /Type /OCG /Name (Adobe Fill & Sign) >>")
+        doc.xref_set_key(
+            catalog,
+            "OCProperties",
+            f"<< /OCGs [{ocg} 0 R] "
+            f"/D << /ON [{ocg} 0 R] /Order [] /RBGroups [] >> >>",
+        )
+        return ocg
+
+    if typ == "xref":
+        ocp = int(val.split()[0])
+        ocg_key, d_key = "OCGs", "D"
+    else:
+        ocp = catalog
+        ocg_key, d_key = "OCProperties/OCGs", "OCProperties/D"
+
+    typ2, val2 = doc.xref_get_key(ocp, ocg_key)
+    if typ2 == "array":
+        refs_text = val2
+    elif typ2 == "xref":
+        refs_text = doc.xref_object(int(val2.split()[0]))
+    else:
+        refs_text = "[]"
+
+    refs = [int(match.group(1)) for match in re.finditer(r"(\d+)\s+0\s+R", refs_text)]
+
+    for ref in refs:
+        name_type, name_val = doc.xref_get_key(ref, "Name")
+        if name_type == "string" and name_val.strip() == "Adobe Fill & Sign":
+            return ref
+
+    ocg = doc.get_new_xref()
+    doc.update_object(ocg, "<< /Type /OCG /Name (Adobe Fill & Sign) >>")
+    refs.append(ocg)
+    new_array = "[" + " ".join(f"{r} 0 R" for r in refs) + "]"
+    try:
+        doc.xref_set_key(ocp, ocg_key, new_array)
+        doc.xref_set_key(ocp, f"{d_key}/ON", new_array)
+    except Exception:
+        # A direct OCProperties dictionary is the normal case; if an unusual
+        # indirect one blocks the nested write, rebuild the top-level entry.
+        doc.xref_set_key(
+            catalog,
+            "OCProperties",
+            f"<< /OCGs {new_array} "
+            f"/D << /ON {new_array} /Order [] /RBGroups [] >> >>",
+        )
+    return ocg
+
+
+def _ensure_fillsign_info(doc: fitz.Document) -> None:
+    catalog = doc.pdf_catalog()
+    typ, _ = doc.xref_get_key(catalog, "ADBE_FillSignInfo")
+    if typ == "null":
+        doc.xref_set_key(catalog, "ADBE_FillSignInfo", "<< /Version 100 >>")
+
+
+def _fillsign_check_form(
+    doc: fitz.Document,
+    page: fitz.Page,
+    mark: MappedMark,
+) -> tuple[int, tuple[float, float, float, float]] | None:
+    """Write one mark as an Adobe Fill & Sign ``/check`` form.
+
+    Returns the form xref and its PDF page-space bounds, or ``None`` when the
+    mark is degenerate.  The form follows Adobe's layout: a BBox at the
+    origin, the path inset by the stroke width, and a translation Matrix.
+    """
+
+    points = tuple((float(p[0]), float(p[1])) for p in mark.points)
+    if len(points) < 2:
+        return None
+
+    # Mapped points use PyMuPDF's top-left page space; page content streams use
+    # the PDF page space (bottom-left origin, and any crop/rotation transform).
+    to_pdf = ~page.transformation_matrix
+    pdf_points: list[tuple[float, float]] = []
+    for x, y in points:
+        pdf_point = fitz.Point(x, y) * to_pdf
+        pdf_points.append((pdf_point.x, pdf_point.y))
+    points = tuple(pdf_points)
+
+    stroke = max(0.15, float(mark.width))
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    if x1 - x0 < 0.05 or y1 - y0 < 0.05:
+        return None
+
+    origin_x = x0 - stroke
+    origin_y = y0 - stroke
+    width = (x1 - x0) + 2 * stroke
+    height = (y1 - y0) + 2 * stroke
+    colour = _pdf_colour(mark.color)
+
+    path = []
+    for index, (px, py) in enumerate(points):
+        op = "m" if index == 0 else "l"
+        path.append(
+            f"{_pdf_number(px - origin_x)} {_pdf_number(py - origin_y)} {op}"
+        )
+    check_content = (
+        f"q\n{colour} RG\n{_pdf_number(stroke)} w 1 J 0 j\n"
+        + "\n".join(path)
+        + "\nS\nQ\n"
+    ).encode("ascii")
+
+    check = doc.get_new_xref()
+    doc.update_object(
+        check,
+        f"<< /Type /XObject /Subtype /Form /FormType 1 "
+        f"/BBox [0 0 {_pdf_number(width)} {_pdf_number(height)}] "
+        f"/Matrix [1 0 0 1 {_pdf_number(origin_x)} {_pdf_number(origin_y)}] "
+        f"/Resources << >> "
+        f"/ADBE_FillSign << /Type /FillSignData /Subtype /check "
+        f"/FieldColor [{colour}] >> >>",
+    )
+    doc.update_stream(check, check_content, compress=True)
+    return check, (origin_x, origin_y, origin_x + width, origin_y + height)
+
+
+Bounds = tuple[float, float, float, float]
+
+
+def _union_bounds(boxes: Iterable[Bounds]) -> Bounds:
+    boxes = list(boxes)
+    return (
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    )
+
+
+def _pdf_bbox(bounds: Bounds) -> str:
+    return "[" + " ".join(_pdf_number(v) for v in bounds) + "]"
+
+
+def _fillsign_subtype(doc: fitz.Document, xref: int) -> str:
+    typ, val = doc.xref_get_key(xref, "ADBE_FillSign/Subtype")
+    return val if typ == "name" else ""
+
+
+def _is_identity_matrix(doc: fitz.Document, xref: int) -> bool:
+    typ, val = doc.xref_get_key(xref, "Matrix")
+    if typ == "null":
+        return True
+    nums = re.findall(r"-?[\d.]+", val) if typ == "array" else []
+    return len(nums) == 6 and [float(n) for n in nums] == [1, 0, 0, 1, 0, 0]
+
+
+def _existing_fillsign_group(
+    doc: fitz.Document, page: fitz.Page
+) -> tuple[int, int] | None:
+    """Return ``(page_form, fields_form)`` of a Fill & Sign group on ``page``.
+
+    Acrobat keeps a single Fill & Sign group per page, so new checks must join
+    an existing group rather than start a second one.  Only the plain layout
+    Adobe writes (identity Matrix on both wrapper forms) is reused.  The form
+    must be invoked by this page's own content: resource dictionaries can be
+    shared between pages, so a listed form may belong to a sibling page.
+    """
+
+    content = page.read_contents()
+    xobjects = page.get_xobjects()
+    for xref, name, parent, _bbox in xobjects:
+        if parent != 0 or _fillsign_subtype(doc, xref) != "/page":
+            continue
+        if not re.search(rb"/" + re.escape(name.encode()) + rb"\s+Do\b", content):
+            continue
+        for child, _child_name, child_parent, _child_bbox in xobjects:
+            if child_parent != xref or _fillsign_subtype(doc, child) != "/fields":
+                continue
+            if _is_identity_matrix(doc, xref) and _is_identity_matrix(doc, child):
+                return xref, child
+    return None
+
+
+def _form_bounds(doc: fitz.Document, xref: int) -> Bounds | None:
+    typ, val = doc.xref_get_key(xref, "BBox")
+    nums = [float(n) for n in re.findall(r"-?[\d.]+", val)] if typ == "array" else []
+    if len(nums) != 4:
+        return None
+    return (
+        min(nums[0], nums[2]),
+        min(nums[1], nums[3]),
+        max(nums[0], nums[2]),
+        max(nums[1], nums[3]),
+    )
+
+
+def _merge_into_fillsign_group(
+    doc: fitz.Document,
+    page_form: int,
+    fields_form: int,
+    checks: Sequence[tuple[int, Bounds]],
+) -> None:
+    """Append check forms to an existing ``/fields`` form and grow its BBox."""
+
+    resources = _ensure_indirect_dict(doc, fields_form, "Resources")
+    xobjects = _ensure_indirect_dict(doc, resources, "XObject")
+    used = set(re.findall(r"/([^\s/<>\[\]()]+)", doc.xref_object(xobjects)))
+    calls = []
+    index = 0
+    for check, _bounds in checks:
+        while f"Fm{index}" in used:
+            index += 1
+        name = f"Fm{index}"
+        used.add(name)
+        doc.xref_set_key(xobjects, name, f"{check} 0 R")
+        calls.append(f"q\n/{name} Do\nQ\n")
+
+    stream = doc.xref_stream(fields_form) or b""
+    if stream and not stream.endswith(b"\n"):
+        stream += b"\n"
+    doc.update_stream(
+        fields_form, stream + "".join(calls).encode("ascii"), compress=True
+    )
+
+    boxes = [b for _, b in checks]
+    for xref in (fields_form, page_form):
+        current = _form_bounds(doc, xref)
+        bounds = _union_bounds(boxes + ([current] if current else []))
+        doc.xref_set_key(xref, "BBox", _pdf_bbox(bounds))
+
+
+def _new_fillsign_group(
+    doc: fitz.Document,
+    checks: Sequence[tuple[int, Bounds]],
+    ocg: int,
+) -> int:
+    """Create Adobe's ``/page`` -> ``/fields`` wrapper around all checks.
+
+    Fill & Sign writes every check on a page as a child of one ``/fields``
+    form.  A separate tree per check leaves only one of them selectable in
+    Acrobat; the others are drawn but behave as flat page content.
+    """
+
+    bbox = _pdf_bbox(_union_bounds(b for _, b in checks))
+    names = " ".join(f"/Fm{i} {xref} 0 R" for i, (xref, _) in enumerate(checks))
+    calls = "".join(
+        f"q\n0 Tc 0 Tw 0 Ts 100 Tz 0 Tr /Fm{i} Do\nQ\n" for i in range(len(checks))
+    )
+
+    fields = doc.get_new_xref()
+    doc.update_object(
+        fields,
+        f"<< /Type /XObject /Subtype /Form /FormType 1 /BBox {bbox} "
+        f"/Matrix [1 0 0 1 0 0] "
+        f"/Resources << /XObject << {names} >> >> "
+        f"/OC << /Type /OCMD /OCGs {ocg} 0 R >> "
+        f"/ADBE_FillSign << /Type /FillSignData /Subtype /fields >> >>",
+    )
+    doc.update_stream(fields, f"0 TL\nq\n{calls}Q\n".encode("ascii"), compress=True)
+
+    outer = doc.get_new_xref()
+    doc.update_object(
+        outer,
+        f"<< /Type /XObject /Subtype /Form /FormType 1 /BBox {bbox} "
+        f"/Matrix [1 0 0 1 0 0] "
+        f"/Resources << /XObject << /Fm0 {fields} 0 R >> >> "
+        f"/ADBE_FillSign << /Type /FillSignData /Subtype /page >> >>",
+    )
+    doc.update_stream(
+        outer, b"q\n0 Tc 0 Tw 0 Ts 100 Tz 0 Tr /Fm0 Do\nQ\n", compress=True
+    )
+    return outer
+
+
+def _append_page_content(
+    doc: fitz.Document, page: fitz.Page, blocks: Sequence[bytes]
+) -> None:
+    if not blocks:
+        return
+    stream_xref = doc.get_new_xref()
+    doc.update_object(stream_xref, "<<>>")
+    doc.update_stream(stream_xref, b"".join(blocks), compress=True)
+    refs = list(page.get_contents()) + [stream_xref]
+    doc.xref_set_key(
+        page.xref, "Contents", "[" + " ".join(f"{r} 0 R" for r in refs) + "]"
+    )
+
+
 def _stamp_page(
     page: fitz.Page,
     marks: Sequence[CheckMark],
@@ -851,19 +1212,8 @@ def _stamp_page(
     vector = [m for m in mapped if m.kind == "vector" and len(m.points) >= 2]
     images = [m for m in mapped if m.kind == "image" and m.png]
 
-    if vector:
-        shape = page.new_shape()
-        for m in vector:
-            shape.draw_polyline([fitz.Point(p) for p in m.points])
-            shape.finish(
-                color=m.color,
-                width=m.width,
-                lineCap=1,
-                lineJoin=0,
-                closePath=False,
-            )
-        shape.commit(overlay=True)
-
+    # Image appearances cannot be represented by Fill & Sign's private check
+    # objects, so they remain images.
     for m in images:
         if m.rect.width < 0.5 or m.rect.height < 0.5:
             continue
@@ -874,7 +1224,35 @@ def _stamp_page(
             keep_proportion=True,
             alpha=-1,
         )
-    return len(vector) + len(images)
+
+    added = 0
+    if vector:
+        doc = page.parent
+        checks = [
+            c for c in (_fillsign_check_form(doc, page, m) for m in vector) if c
+        ]
+        if checks:
+            _ensure_fillsign_info(doc)
+            group = _existing_fillsign_group(doc, page)
+            if group:
+                _merge_into_fillsign_group(doc, *group, checks)
+            else:
+                outer = _new_fillsign_group(doc, checks, _fillsign_ocg(doc))
+                existing = {item[1] for item in page.get_xobjects()}
+                index = 0
+                while f"FmFS{index}" in existing:
+                    index += 1
+                name = f"FmFS{index}"
+                _add_page_xobject(doc, page, name, outer)
+                _append_page_content(
+                    doc,
+                    page,
+                    [f"/ADBE_FillSign BMC\nq\n0 G\n/{name} Do\nQ\nEMC\n".encode("ascii")],
+                )
+            added = len(checks)
+
+    return added + len(images)
+
 
 
 def write_copy(

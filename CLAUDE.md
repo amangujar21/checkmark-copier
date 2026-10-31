@@ -30,7 +30,7 @@ python -m unittest discover -s tests -v
 python -m unittest discover -s tests -p "test_core.py" -v
 python -m unittest discover -s tests -p "test_core.py" -v -k test_adobe_geometry
 
-# Build the one-file EXE and release ZIP
+# Build the one-file EXE, the portable folder and both release ZIPs
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 # Development-only screenshot / auto-close
@@ -59,7 +59,7 @@ python app.py --demo --demo-preview result --screenshot samples\shot.png --smoke
    - `kind == "vector"`: exact PDF points, stroke width, and normalized RGB colour.
    - `kind == "image"`: a transparent PNG cropped from a small annotation appearance, plus its page-space rect.
 3. `project_mark()` maps a mark from the source page to a target page using either `proportional` (fractional position, uniform scale) or `absolute` (point units, page-origin offset).
-4. `_stamp_page()` draws all vector marks through one `Page.new_shape()` and inserts image marks with alpha.
+4. `_stamp_page()` writes every vector mark as Adobe's native Fill & Sign object tree (page-content marked section plus `/page`, `/fields` and `/check` form XObjects) and inserts image marks with alpha. It does not draw vector marks as ordinary page content.
 5. `write_copy()` opens a fresh document, authenticates if needed, stamps every target page, saves to a temp file in the destination directory, and `os.replace()`s it into place.
 
 Key public types: `CheckMark`, `MappedMark`, `CopyStats`. Key entry points: `detect_checks`, `parse_page_range`, `project_mark`, `write_copy`, `render_page`, `composite_result_preview`.
@@ -87,7 +87,8 @@ These are the easiest places to introduce subtle bugs:
 - Use `point_to_rotated` / `point_to_unrotated` / `rect_to_rotated_bbox` when drawing to the canvas; do not mix visible `page.rect` coordinates with drawing coordinates on rotated pages.
 - PDF colours in this codebase are normalized floats in `[0, 1]`; Tk needs hex (`colour_to_hex`).
 - Path rects from `get_drawings()` describe the path, not the stroked bounds. Do not assume the drawing rect includes the stroke.
-- `Page.draw_polyline` and `Shape.finish` use `lineCap=1` (round) and `lineJoin=0` (miter) to match the Adobe mark. Do not change these independently of the template.
+- `CheckMark`/`MappedMark` points and `get_drawings()` use PyMuPDF's top-left page space. Raw PDF content streams (including the Fill & Sign forms) use PDF page space with a bottom-left origin. Convert with `~page.transformation_matrix` before writing form geometry; skipping this flips marks vertically.
+- Form content follows the Adobe template: round line cap (`1 J`), miter join (`0 j`), stroke width copied from the mark. Do not change these independently of the template.
 - Image marks are inserted with `alpha=-1`; preserve transparency, otherwise a white box will cover the target page.
 - Rotated target pages are handled in unrotated page coordinates. A target with a different rotation will follow that coordinate system, not the visible orientation.
 
@@ -104,6 +105,20 @@ d = (width + height) / 20
 - Default black; Adobe's selected blue is `#2175C8` (`core.ADOBE_BLUE`).
 - `_adobe_template_mask()` must stay in sync with `adobe_check_mark()` because annotation classification compares appearance masks against that template.
 - If the geometry changes, update `adobe_check_mark`, `_adobe_template_mask`, the X-template rejection logic if relevant, and `test_adobe_geometry` together.
+
+## Native Fill & Sign output
+
+Acrobat Fill & Sign does **not** store check marks as annotations. A real Adobe check is a page-content object:
+
+- Page content contains `/ADBE_FillSign BMC ... /FmN Do ... EMC`.
+- The invoked form has `/ADBE_FillSign << /Type /FillSignData /Subtype /page >>`.
+- That form invokes a `/fields` form carrying the `/OC` optional-content group.
+- The `/fields` form invokes a `/check` form with `/FieldColor [r g b]`; the check path and stroke live in this innermost form.
+- The catalog has `/ADBE_FillSignInfo << /Version 100 >>` and the "Adobe Fill & Sign" OCG is referenced from `/OCProperties`.
+
+`_stamp_page` reproduces this tree with **one group per page**: a single `/ADBE_FillSign` block → one `/page` form → one `/fields` form, with one `/check` child per vector mark (exactly as Adobe writes multiple checks). Acrobat adopts only one Fill & Sign group per page, so a separate tree per mark leaves all but one check unselectable. If the target page already has a group invoked by its content, new checks are merged into its `/fields` form and the BBoxes are grown. It reuses an existing Fill & Sign OCG when present, otherwise creates one. `test_fillsign_checks_share_one_group_per_page` covers both cases. `test_fillsign_objects_are_native` asserts the tree; do not replace this with ordinary `Page.draw_polyline()` output, which is visible but not selectable in Acrobat.
+
+Adobe's default check form uses a square BBox, a local path inset by the stroke width, and a translation Matrix. The generated forms follow the same pattern so Acrobat's Fill & Sign selection continues to work.
 
 ## Detection details
 
@@ -141,7 +156,8 @@ Run the full suite before committing. The core tests generate PDFs at runtime an
 2. Verify exact coordinates, not just “a mark exists”.
 3. Verify the input file hash is unchanged.
 4. Include rotation and image-annotation cases when touching coordinate or mask code.
-5. For UI changes, run the smoke suite and, if possible, inspect a fresh screenshot with `--screenshot`.
+5. When touching stamping, keep `test_fillsign_objects_are_native` passing; visible vector output alone is not sufficient.
+6. For UI changes, run the smoke suite and, if possible, inspect a fresh screenshot with `--screenshot`.
 
 The GUI smoke tests run with `root.withdraw()` and test the save worker; avoid adding tests that require a visible desktop.
 
@@ -150,13 +166,14 @@ The GUI smoke tests run with `root.withdraw()` and test the save worker; avoid a
 ## Packaging notes
 
 - PyInstaller command is in `build.ps1`; it uses `--onefile`, `--windowed`, `--add-data "assets;assets"`, and `version_info.txt`.
+- `build.ps1` also emits a portable `--onedir` build (`dist\CheckmarkCopier-portable\` plus `CheckmarkCopier-1.0.0-win64-portable.zip`). It runs in place and never unpacks into `%TEMP%`, which makes it the fallback whenever the one-file bootloader cannot create its extraction directory.
 - `assets/app.ico` is the EXE icon; `assets/app_256.png` is the in-window icon. Both must be bundled.
 - `--demo` is a development aid and resolves `samples/demo.pdf` relative to `app.py`; the demo PDF is not bundled into the EXE.
-- In restricted Windows sandboxes, a one-file PyInstaller EXE can fail to create its extraction directory when launched from a deep workspace path. Test the built EXE from a short path (for example the Desktop) or use an onedir build as a fallback.
+- A one-file EXE that shows `Could not create temporary directory!` has failed inside the PyInstaller bootloader, before Python starts: it could not create `_MEIxxxxxx` under `%TEMP%` (missing/redirected/read-only `TEMP`/`TMP`, a sandbox that blocks writes there, or a stale `_MEI*` folder). Nothing reaches `app.log` in that case. Diagnose with `GetTempPathW` + `CreateDirectoryW` instead of the app, test the built EXE from a short path (for example the Desktop), and point the reporter at the portable build.
 - `dist/` is git-ignored. Keep release artifacts out of commits unless the repository policy changes.
 
 ## Current scope
 
-Supported: one source page, multiple checks on that page, target page ranges with source exclusion, same-size exact copies, proportional size mapping, rotated pages, password-protected PDFs, vector and small annotation appearances, demo/manual placement, and an offline single-file build.
+Supported: one source page, multiple checks on that page, target page ranges with source exclusion, same-size exact copies, proportional size mapping, rotated pages, password-protected PDFs, vector and small annotation appearances, native Fill & Sign selectable output for vector checks, demo/manual placement, and an offline single-file build.
 
 Not supported: OCR or automatic detection of checks that are only pixels on a scanned page (manual placement is the fallback), automatic target-page editing, multi-source-page batches, or preserving digital signatures after modification.

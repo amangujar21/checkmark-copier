@@ -89,6 +89,151 @@ class CoreTests(unittest.TestCase):
                 self.assertAlmostEqual(a.width, b.width, places=3)
         doc.close()
 
+    def test_fillsign_objects_are_native(self):
+        """Copied vector checks must be real Fill & Sign page objects.
+
+        Adobe does not store its check marks as annotations.  It writes a
+        marked-content section containing /page, /fields and /check form
+        XObjects carrying /ADBE_FillSign metadata.  Acrobat only treats a
+        check as selectable/movable when that tree is present.
+        """
+
+        src = self.path("fs_src.pdf")
+        make_pdf(src, pages=2)
+        doc = fitz.open(src)
+        draw_check(doc[0], (120, 120), size=18, colour=core.ADOBE_RED)
+        doc.saveIncr()
+        doc.close()
+
+        doc = fitz.open(src)
+        marks = core.detect_checks(doc[0])
+        doc.close()
+        out = self.path("fs_out.pdf")
+        core.write_copy(src, out, 0, [1], marks)
+
+        doc = fitz.open(out)
+        page = doc[1]
+        content = page.read_contents().decode("latin-1")
+        self.assertIn("/ADBE_FillSign BMC", content)
+        self.assertIn("/FmFS0 Do", content)
+
+        xobjects = page.get_xobjects()
+        self.assertIn("FmFS0", {name for _, name, _, _ in xobjects})
+        subtypes = []
+        colours = []
+        for xref, _name, _parent, _bbox in xobjects:
+            typ, val = doc.xref_get_key(xref, "ADBE_FillSign/Subtype")
+            if typ == "name":
+                subtypes.append(val)
+            colour_type, colour = doc.xref_get_key(xref, "ADBE_FillSign/FieldColor")
+            if colour_type == "array":
+                colours.append(colour)
+        self.assertIn("/page", subtypes)
+        self.assertIn("/fields", subtypes)
+        self.assertIn("/check", subtypes)
+        self.assertTrue(colours, "check form must carry Adobe's FieldColor")
+        self.assertEqual(
+            len(colours), sum(1 for value in subtypes if value == "/check")
+        )
+
+        info_type, info_version = doc.xref_get_key(
+            doc.pdf_catalog(), "ADBE_FillSignInfo/Version"
+        )
+        self.assertEqual((info_type, info_version), ("int", "100"))
+        doc.close()
+
+    def _fillsign_tree(self, doc, page):
+        """Return (page forms, fields forms, check forms) on ``page``."""
+
+        tree = {"/page": [], "/fields": [], "/check": []}
+        for xref, _name, parent, _bbox in page.get_xobjects():
+            typ, val = doc.xref_get_key(xref, "ADBE_FillSign/Subtype")
+            if typ == "name" and val in tree:
+                tree[val].append((xref, parent))
+        return tree["/page"], tree["/fields"], tree["/check"]
+
+    def test_fillsign_checks_share_one_group_per_page(self):
+        """Acrobat selects only one Fill & Sign group per page.
+
+        Every check on a page must be a child of a single /fields form, as in
+        Adobe's own output; otherwise only one copied check is movable.
+        """
+
+        src = self.path("fs_multi_src.pdf")
+        make_pdf(src, pages=2)
+        doc = fitz.open(src)
+        for x in (80, 250, 420):
+            draw_check(doc[0], (x, 120), size=18, colour=core.ADOBE_RED)
+        doc.saveIncr()
+        doc.close()
+
+        doc = fitz.open(src)
+        marks = core.detect_checks(doc[0])
+        doc.close()
+        self.assertEqual(len(marks), 3)
+        out = self.path("fs_multi_out.pdf")
+        core.write_copy(src, out, 0, [1], marks)
+
+        doc = fitz.open(out)
+        page = doc[1]
+        content = page.read_contents().decode("latin-1")
+        self.assertEqual(content.count("/ADBE_FillSign BMC"), 1)
+        pages, fields, checks = self._fillsign_tree(doc, page)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0][1], pages[0][0])
+        self.assertEqual(len(checks), 3)
+        self.assertTrue(all(parent == fields[0][0] for _, parent in checks))
+        self.assertEqual(len(core.detect_checks(page)), 3)
+        doc.close()
+
+        # Copying onto a page that already has a group must extend it rather
+        # than add a second group.
+        out2 = self.path("fs_multi_out2.pdf")
+        doc = fitz.open(src)
+        first = core.detect_checks(doc[0])[:1]
+        doc.close()
+        core.write_copy(out, out2, 0, [1], first, mode="absolute")
+        doc = fitz.open(out2)
+        page = doc[1]
+        content = page.read_contents().decode("latin-1")
+        self.assertEqual(content.count("/ADBE_FillSign BMC"), 1)
+        pages, fields, checks = self._fillsign_tree(doc, page)
+        self.assertEqual((len(pages), len(fields), len(checks)), (1, 1, 4))
+        self.assertTrue(all(parent == fields[0][0] for _, parent in checks))
+        doc.close()
+
+    def test_encrypted_output_keeps_fillsign_objects(self):
+        src = self.path("enc_src.pdf")
+        make_pdf(src, pages=2)
+        doc = fitz.open(src)
+        draw_check(doc[0], (120, 120), size=18, colour=core.ADOBE_RED)
+        doc.save(
+            src + ".tmp",
+            encryption=fitz.PDF_ENCRYPT_AES_256,
+            owner_pw="owner",
+            user_pw="user",
+        )
+        doc.close()
+        os.replace(src + ".tmp", src)
+
+        doc = fitz.open(src)
+        self.assertTrue(doc.authenticate("user"))
+        marks = core.detect_checks(doc[0])
+        doc.close()
+        self.assertEqual(len(marks), 1)
+
+        out = self.path("enc_out.pdf")
+        core.write_copy(src, out, 0, [1], marks, password="user")
+        doc = fitz.open(out)
+        self.assertTrue(doc.needs_pass)
+        self.assertTrue(doc.authenticate("user"))
+        copied = core.detect_checks(doc[1])
+        self.assertEqual(len(copied), 1)
+        content = doc[1].read_contents().decode("latin-1")
+        self.assertIn("/ADBE_FillSign BMC", content)
+        doc.close()
+
     def test_rotated_page(self):
         src = self.path("rot.pdf")
         make_pdf(src, pages=2, rotation=90)
