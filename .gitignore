@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+tests/*.log
+samples/ui_*.png
+samples/*.pdf
+!samples/demo.pdf
+!samples/.gitkeep
