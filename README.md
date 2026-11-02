@@ -63,7 +63,7 @@ The one-file build unpacks itself into `%TEMP%` on every launch, so that folder 
 
 Any of these gets you going again:
 
-- Run the portable build: `dist\CheckmarkCopier-portable\CheckmarkCopier.exe` (or unzip `dist\CheckmarkCopier-1.0.0-win64-portable.zip` and run the exe inside). A folder build runs in place and never touches `%TEMP%`, so it also works from a restricted or sandboxed shell.
+- Run the portable build: `dist\CheckmarkCopier-portable\CheckmarkCopier.exe` (or unzip `dist\CheckmarkCopier-1.0.1-win64-portable.zip` and run the exe inside). A folder build runs in place and never touches `%TEMP%`, so it also works from a restricted or sandboxed shell.
 - Or point `TEMP` and `TMP` at a normal writable folder (for example `C:\Users\<you>\AppData\Local\Temp`), then start the single file again.
 
 ## Building from source

@@ -203,6 +203,136 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(all(parent == fields[0][0] for _, parent in checks))
         doc.close()
 
+    def test_fillsign_groups_not_listed_on_sibling_pages(self):
+        """Pages sharing one /Resources object must not see each other's groups.
+
+        Office exports often point every page at one resources dictionary.  If
+        a page's Fill & Sign form were added there, Acrobat would list it on
+        every page and attach checks added on one page to another page's group.
+        """
+
+        src = self.path("fs_shared_src.pdf")
+        make_pdf(src, pages=4)
+        doc = fitz.open(src)
+        shared = doc.get_new_xref()
+        doc.update_object(shared, "<< >>")
+        for page in doc:
+            doc.xref_set_key(page.xref, "Resources", f"{shared} 0 R")
+        draw_check(doc[0], (120, 120), size=18)
+        doc.save(self.path("fs_shared_src2.pdf"))
+        doc.close()
+        src = self.path("fs_shared_src2.pdf")
+        with open(src, "rb") as fh:
+            before = hashlib.sha256(fh.read()).hexdigest()
+
+        doc = fitz.open(src)
+        marks = core.detect_checks(doc[0])
+        doc.close()
+        self.assertEqual(len(marks), 1)
+        out = self.path("fs_shared_out.pdf")
+        core.write_copy(src, out, 0, [1, 2, 3], marks)
+
+        doc = fitz.open(out)
+        resources = set()
+        for index in (1, 2, 3):
+            page = doc[index]
+            resources.add(doc.xref_get_key(page.xref, "Resources")[1])
+            pages, fields, checks = self._fillsign_tree(doc, page)
+            self.assertEqual((len(pages), len(fields), len(checks)), (1, 1, 1))
+            top = [x for x, _n, parent, _b in page.get_xobjects() if parent == 0]
+            self.assertEqual(top, [pages[0][0]])
+        self.assertEqual(len(resources), 3)
+        self.assertEqual(
+            [x for x, _n, p, _b in doc[0].get_xobjects() if p == 0], []
+        )
+        doc.close()
+        with open(src, "rb") as fh:
+            self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), before)
+
+    def _assert_pages_list_only_own_groups(self, doc):
+        for page in doc:
+            content = page.read_contents()
+            for xref, name, parent, _b in page.get_xobjects():
+                typ, val = doc.xref_get_key(xref, "ADBE_FillSign/Subtype")
+                if parent == 0 and typ == "name" and val == "/page":
+                    self.assertIn(f"/{name} Do".encode(), content, f"page {page.number + 1}")
+
+    def _shared_checks_pdf(self, name):
+        """Source page 1 with one check; pages 2-4 share one /Resources object."""
+
+        src = self.path(name)
+        make_pdf(src, pages=4)
+        doc = fitz.open(src)
+        shared = doc.get_new_xref()
+        doc.update_object(shared, "<< >>")
+        for page in doc:
+            doc.xref_set_key(page.xref, "Resources", f"{shared} 0 R")
+        draw_check(doc[0], (120, 120), size=18)
+        out = self.path("full_" + name)
+        doc.save(out)
+        doc.close()
+        doc = fitz.open(out)
+        marks = core.detect_checks(doc[0])
+        doc.close()
+        return out, marks
+
+    def test_repairs_groups_listed_on_sibling_pages(self):
+        """Files written by 1.0.0 list every page's group on every page."""
+
+        src, marks = self._shared_checks_pdf("fs_broken_src.pdf")
+        good = self.path("fs_broken_good.pdf")
+        core.write_copy(src, good, 0, [1, 2, 3], marks)
+
+        # Rebuild the 1.0.0 layout: one shared dict listing all three groups.
+        doc = fitz.open(good)
+        entries = []
+        for i, index in enumerate((1, 2, 3)):
+            page = doc[index]
+            (form, _p), = self._fillsign_tree(doc, page)[0]
+            entries.append(f"/FmFS{i} {form} 0 R")
+            last = page.get_contents()[-1]
+            doc.update_stream(last, doc.xref_stream(last).replace(b"/FmFS0 Do", f"/FmFS{i} Do".encode()))
+        shared = doc.get_new_xref()
+        doc.update_object(shared, "<< /XObject << " + " ".join(entries) + " >> >>")
+        for page in doc:
+            doc.xref_set_key(page.xref, "Resources", f"{shared} 0 R")
+        broken = self.path("fs_broken.pdf")
+        doc.save(broken)
+        doc.close()
+
+        fixed = self.path("fs_broken_fixed.pdf")
+        core.write_copy(broken, fixed, 0, [2], marks, mode="absolute")
+        doc = fitz.open(fixed)
+        self._assert_pages_list_only_own_groups(doc)
+        counts = [len(self._fillsign_tree(doc, doc[i])[2]) for i in range(4)]
+        self.assertEqual(counts, [0, 1, 2, 1])
+        doc.close()
+
+    def test_group_drawn_by_two_pages_is_not_merged_into(self):
+        src, marks = self._shared_checks_pdf("fs_dup_src.pdf")
+        first = self.path("fs_dup_first.pdf")
+        core.write_copy(src, first, 0, [1], marks)
+
+        # Make page 3 draw page 2's group too (same content stream object).
+        doc = fitz.open(first)
+        doc.xref_set_key(doc[2].xref, "Resources", doc.xref_get_key(doc[1].xref, "Resources")[1])
+        doc.xref_set_key(doc[2].xref, "Contents", doc.xref_get_key(doc[1].xref, "Contents")[1])
+        dup = self.path("fs_dup.pdf")
+        doc.save(dup)
+        doc.close()
+
+        out = self.path("fs_dup_out.pdf")
+        core.write_copy(dup, out, 0, [2], marks, mode="absolute")
+        doc = fitz.open(out)
+        self._assert_pages_list_only_own_groups(doc)
+        page2, page3 = doc[1], doc[2]
+        tree2, tree3 = self._fillsign_tree(doc, page2), self._fillsign_tree(doc, page3)
+        self.assertEqual(len(tree2[2]), 1)
+        self.assertEqual(len(tree3[0]), 1)
+        self.assertEqual(len(tree3[2]), 2)
+        self.assertNotEqual(tree2[0][0][0], tree3[0][0][0])
+        doc.close()
+
     def test_encrypted_output_keeps_fillsign_objects(self):
         src = self.path("enc_src.pdf")
         make_pdf(src, pages=2)

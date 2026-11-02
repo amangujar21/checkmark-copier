@@ -118,6 +118,8 @@ Acrobat Fill & Sign does **not** store check marks as annotations. A real Adobe 
 
 `_stamp_page` reproduces this tree with **one group per page**: a single `/ADBE_FillSign` block → one `/page` form → one `/fields` form, with one `/check` child per vector mark (exactly as Adobe writes multiple checks). Acrobat adopts only one Fill & Sign group per page, so a separate tree per mark leaves all but one check unselectable. If the target page already has a group invoked by its content, new checks are merged into its `/fields` form and the BBoxes are grown. It reuses an existing Fill & Sign OCG when present, otherwise creates one. `test_fillsign_checks_share_one_group_per_page` covers both cases. `test_fillsign_objects_are_native` asserts the tree; do not replace this with ordinary `Page.draw_polyline()` output, which is visible but not selectable in Acrobat.
 
+**Never add a Fill & Sign form to a resources dictionary another page uses.** Office/PowerPoint exports often point every page at one indirect `/Resources` object. If a page's group is listed there, Acrobat attaches checks the user adds on one page to another page's group, and they appear on several pages. `_private_page_resources` always clones the page's top-level `/Resources` and `/XObject` dicts before adding a form. `write_copy` first runs `_isolate_fillsign_resources`, which removes groups a page lists but does not draw (repairing 1.0.0 output). `_private_fillsign_group` clones a group before merging into it if more than one page draws it. Tests: `test_fillsign_groups_not_listed_on_sibling_pages`, `test_repairs_groups_listed_on_sibling_pages`, `test_group_drawn_by_two_pages_is_not_merged_into`.
+
 Adobe's default check form uses a square BBox, a local path inset by the stroke width, and a translation Matrix. The generated forms follow the same pattern so Acrobat's Fill & Sign selection continues to work.
 
 ## Detection details
@@ -166,7 +168,7 @@ The GUI smoke tests run with `root.withdraw()` and test the save worker; avoid a
 ## Packaging notes
 
 - PyInstaller command is in `build.ps1`; it uses `--onefile`, `--windowed`, `--add-data "assets;assets"`, and `version_info.txt`.
-- `build.ps1` also emits a portable `--onedir` build (`dist\CheckmarkCopier-portable\` plus `CheckmarkCopier-1.0.0-win64-portable.zip`). It runs in place and never unpacks into `%TEMP%`, which makes it the fallback whenever the one-file bootloader cannot create its extraction directory.
+- `build.ps1` also emits a portable `--onedir` build (`dist\CheckmarkCopier-portable\` plus `CheckmarkCopier-1.0.1-win64-portable.zip`). It runs in place and never unpacks into `%TEMP%`, which makes it the fallback whenever the one-file bootloader cannot create its extraction directory.
 - `assets/app.ico` is the EXE icon; `assets/app_256.png` is the in-window icon. Both must be bundled.
 - `--demo` is a development aid and resolves `samples/demo.pdf` relative to `app.py`; the demo PDF is not bundled into the EXE.
 - A one-file EXE that shows `Could not create temporary directory!` has failed inside the PyInstaller bootloader, before Python starts: it could not create `_MEIxxxxxx` under `%TEMP%` (missing/redirected/read-only `TEMP`/`TMP`, a sandbox that blocks writes there, or a stale `_MEI*` folder). Nothing reaches `app.log` in that case. Diagnose with `GetTempPathW` + `CreateDirectoryW` instead of the app, test the built EXE from a short path (for example the Desktop), and point the reporter at the portable build.

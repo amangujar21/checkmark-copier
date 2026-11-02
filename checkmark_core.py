@@ -877,36 +877,49 @@ def _ensure_indirect_dict(doc: fitz.Document, xref: int, key: str) -> int:
     return new_xref
 
 
-def _page_resources(doc: fitz.Document, page: fitz.Page) -> int:
-    """Return the page's own resources dictionary.
+def _private_page_resources(doc: fitz.Document, page: fitz.Page) -> int:
+    """Give the page a resources dictionary no other page uses, and return it.
 
-    Resources may be inherited from the page tree.  In that case they are
-    copied onto this page first so adding a form cannot affect sibling pages.
+    Office/PowerPoint exports commonly point every page at one indirect
+    ``/Resources`` object (or inherit it from the page tree).  Adding a Fill &
+    Sign form to such a shared dictionary lists that form on every page, and
+    Acrobat then attaches checks added on one page to another page's Fill &
+    Sign group, so they show up on several pages.  The resources (and their
+    ``/XObject`` sub-dictionary) are therefore always cloned for this page.
+    Only the top-level dictionaries are copied; fonts, images and other
+    entries remain shared references.
     """
 
     xref = page.xref
+    text = "<<>>"
     for _ in range(32):
         typ, val = doc.xref_get_key(xref, "Resources")
         if typ == "xref":
-            return int(val.split()[0])
+            text = doc.xref_object(int(val.split()[0]), compressed=True)
+            break
         if typ == "dict":
-            resources = doc.get_new_xref()
-            doc.update_object(resources, val)
-            doc.xref_set_key(page.xref, "Resources", f"{resources} 0 R")
-            return resources
+            text = val
+            break
         ptype, pval = doc.xref_get_key(xref, "Parent")
         if ptype != "xref":
             break
         xref = int(pval.split()[0])
 
     resources = doc.get_new_xref()
-    doc.update_object(resources, "<<>>")
+    doc.update_object(resources, text)
     doc.xref_set_key(page.xref, "Resources", f"{resources} 0 R")
+
+    typ, val = doc.xref_get_key(resources, "XObject")
+    if typ == "xref":
+        val = doc.xref_object(int(val.split()[0]), compressed=True)
+    xobjects = doc.get_new_xref()
+    doc.update_object(xobjects, val if typ in ("dict", "xref") else "<<>>")
+    doc.xref_set_key(resources, "XObject", f"{xobjects} 0 R")
     return resources
 
 
 def _add_page_xobject(doc: fitz.Document, page: fitz.Page, name: str, xref: int) -> None:
-    resources = _page_resources(doc, page)
+    resources = _private_page_resources(doc, page)
     xobjects = _ensure_indirect_dict(doc, resources, "XObject")
     doc.xref_set_key(xobjects, name, f"{xref} 0 R")
 
@@ -1110,6 +1123,96 @@ def _form_bounds(doc: fitz.Document, xref: int) -> Bounds | None:
     )
 
 
+def _invokes(content: bytes, name: str) -> bool:
+    return bool(re.search(rb"/" + re.escape(name.encode()) + rb"\s+Do\b", content))
+
+
+def _isolate_fillsign_resources(doc: fitz.Document) -> dict[int, int]:
+    """Make each page list only the Fill & Sign groups its own content draws.
+
+    Earlier versions added each page's group to a ``/Resources`` dictionary
+    shared by many pages, and Acrobat then attached checks added on one page
+    to another page's group.  Pages listing a group they do not invoke get a
+    private resources dictionary without it, which also repairs such files
+    when they are run through the tool again.
+
+    Returns ``{page_form_xref: number of pages invoking it}``.
+    """
+
+    users: dict[int, int] = {}
+    for page in doc:
+        content = page.read_contents()
+        foreign = []
+        for xref, name, parent, _bbox in page.get_xobjects():
+            if parent != 0 or _fillsign_subtype(doc, xref) != "/page":
+                continue
+            if _invokes(content, name):
+                users[xref] = users.get(xref, 0) + 1
+            else:
+                foreign.append(name)
+        if foreign:
+            resources = _private_page_resources(doc, page)
+            xobjects = _ensure_indirect_dict(doc, resources, "XObject")
+            for name in foreign:
+                doc.xref_set_key(xobjects, name, "null")
+    return users
+
+
+def _clone_object(doc: fitz.Document, xref: int) -> int:
+    clone = doc.get_new_xref()
+    doc.update_object(clone, doc.xref_object(xref, compressed=True))
+    if doc.xref_is_stream(xref):
+        doc.update_stream(clone, doc.xref_stream(xref) or b"", compress=True)
+    return clone
+
+
+def _clone_with_xobjects(doc: fitz.Document, xref: int) -> tuple[int, int]:
+    """Clone a form plus its Resources and XObject dicts; return (form, xobjects)."""
+
+    form = _clone_object(doc, xref)
+    typ, val = doc.xref_get_key(form, "Resources")
+    resources = doc.get_new_xref()
+    if typ == "xref":
+        doc.update_object(resources, doc.xref_object(int(val.split()[0]), compressed=True))
+    else:
+        doc.update_object(resources, val if typ == "dict" else "<<>>")
+    doc.xref_set_key(form, "Resources", f"{resources} 0 R")
+    typ, val = doc.xref_get_key(resources, "XObject")
+    if typ == "xref":
+        val = doc.xref_object(int(val.split()[0]), compressed=True)
+    xobjects = doc.get_new_xref()
+    doc.update_object(xobjects, val if typ in ("dict", "xref") else "<<>>")
+    doc.xref_set_key(resources, "XObject", f"{xobjects} 0 R")
+    return form, xobjects
+
+
+def _private_fillsign_group(
+    doc: fitz.Document, page: fitz.Page, page_form: int, fields_form: int
+) -> tuple[int, int]:
+    """Give ``page`` its own copy of a group that other pages also draw.
+
+    Merging new checks into a shared group would show them on every page that
+    draws it.
+    """
+
+    page_name = fields_name = None
+    for xref, name, parent, _bbox in page.get_xobjects():
+        if parent == 0 and xref == page_form:
+            page_name = name
+        elif parent == page_form and xref == fields_form:
+            fields_name = name
+    if page_name is None or fields_name is None:
+        return page_form, fields_form
+
+    new_fields, _ = _clone_with_xobjects(doc, fields_form)
+    new_page, page_xobjects = _clone_with_xobjects(doc, page_form)
+    doc.xref_set_key(page_xobjects, fields_name, f"{new_fields} 0 R")
+    resources = _private_page_resources(doc, page)
+    xobjects = _ensure_indirect_dict(doc, resources, "XObject")
+    doc.xref_set_key(xobjects, page_name, f"{new_page} 0 R")
+    return new_page, new_fields
+
+
 def _merge_into_fillsign_group(
     doc: fitz.Document,
     page_form: int,
@@ -1207,6 +1310,7 @@ def _stamp_page(
     marks: Sequence[CheckMark],
     src_page: fitz.Page,
     mode: str,
+    group_users: dict[int, int] | None = None,
 ) -> int:
     mapped = [project_mark(m, src_page, page, mode) for m in marks if m.enabled]
     vector = [m for m in mapped if m.kind == "vector" and len(m.points) >= 2]
@@ -1235,6 +1339,10 @@ def _stamp_page(
             _ensure_fillsign_info(doc)
             group = _existing_fillsign_group(doc, page)
             if group:
+                if group_users is not None and group_users.get(group[0], 1) > 1:
+                    group_users[group[0]] -= 1
+                    group = _private_fillsign_group(doc, page, *group)
+                    group_users[group[0]] = 1
                 _merge_into_fillsign_group(doc, *group, checks)
             else:
                 outer = _new_fillsign_group(doc, checks, _fillsign_ocg(doc))
@@ -1296,9 +1404,10 @@ def write_copy(
         if not enabled:
             raise ValueError("No check marks are selected.")
 
+        group_users = _isolate_fillsign_resources(doc)
         stamp_count = 0
         for p in targets:
-            stamp_count += _stamp_page(doc[p], enabled, src_page, mode)
+            stamp_count += _stamp_page(doc[p], enabled, src_page, mode, group_users)
 
         out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
         os.makedirs(out_dir, exist_ok=True)

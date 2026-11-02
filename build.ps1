@@ -46,7 +46,7 @@ Copy-Item README.md dist\README.md -Force
 Copy-Item LICENSE.txt dist\LICENSE.txt -Force
 Copy-Item samples\demo.pdf dist\demo.pdf -Force
 Compress-Archive -Path dist\CheckmarkCopier.exe, dist\README.md, dist\LICENSE.txt, dist\demo.pdf `
-    -DestinationPath "dist\CheckmarkCopier-1.0.0-win64.zip" -Force
+    -DestinationPath "dist\CheckmarkCopier-1.0.1-win64.zip" -Force
 
 Move-Item "dist\portable\CheckmarkCopier" "dist\CheckmarkCopier-portable"
 Remove-Item "dist\portable" -Recurse -Force
@@ -54,11 +54,11 @@ Copy-Item README.md dist\CheckmarkCopier-portable\README.md -Force
 Copy-Item LICENSE.txt dist\CheckmarkCopier-portable\LICENSE.txt -Force
 Copy-Item samples\demo.pdf dist\CheckmarkCopier-portable\demo.pdf -Force
 Compress-Archive -Path "dist\CheckmarkCopier-portable" `
-    -DestinationPath "dist\CheckmarkCopier-1.0.0-win64-portable.zip" -Force
+    -DestinationPath "dist\CheckmarkCopier-1.0.1-win64-portable.zip" -Force
 
 Write-Host ""
 Write-Host "Built: $root\dist\CheckmarkCopier.exe"
 Get-Item dist\CheckmarkCopier.exe | Select-Object FullName, Length, LastWriteTime | Format-List
-Get-Item "dist\CheckmarkCopier-1.0.0-win64.zip" | Select-Object FullName, Length, LastWriteTime | Format-List
+Get-Item "dist\CheckmarkCopier-1.0.1-win64.zip" | Select-Object FullName, Length, LastWriteTime | Format-List
 Write-Host "Built: $root\dist\CheckmarkCopier-portable\CheckmarkCopier.exe"
-Get-Item "dist\CheckmarkCopier-1.0.0-win64-portable.zip" | Select-Object FullName, Length, LastWriteTime | Format-List
+Get-Item "dist\CheckmarkCopier-1.0.1-win64-portable.zip" | Select-Object FullName, Length, LastWriteTime | Format-List

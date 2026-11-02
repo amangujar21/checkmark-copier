@@ -20,7 +20,7 @@ from PIL import Image, ImageGrab, ImageTk
 import checkmark_core as core
 
 APP_NAME = "Checkmark Copier"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # Palette -------------------------------------------------------------------
 BG = "#F3F5F9"
